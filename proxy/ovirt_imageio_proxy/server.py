@@ -28,6 +28,7 @@ from ovirt_imageio_common import web
 from . import images
 from . import info
 from . import sessions
+from . import tasks
 from . import tickets
 
 
@@ -45,6 +46,7 @@ class Server:
         app = web.Application(config, [
             (r"/images/(.*)", images.RequestHandler),
             (r"/tickets/(.*)", tickets.RequestHandler),
+            (r"/tasks/(.*)", tasks.RequestHandler),
             (r"/sessions/(.*)", sessions.RequestHandler),
             (r"/info/", info.RequestHandler),
         ])

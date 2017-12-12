@@ -8,6 +8,7 @@
 
 from __future__ import absolute_import
 
+import celery
 import json
 import logging
 import logging.config
@@ -41,11 +42,14 @@ from . import pki
 from . import uhttp
 from . import tickets
 
+from . import celery_tasks
+
 CONF_DIR = "/etc/ovirt-imageio-daemon"
 
 log = logging.getLogger("server")
 image_server = None
 ticket_server = None
+task_server = None
 running = True
 
 
@@ -84,14 +88,16 @@ def terminate(signo, frame):
 
 
 def start(config):
-    global image_server, ticket_server
-    assert not (image_server or ticket_server)
+    global image_server, ticket_server, task_server
+    assert not (image_server or ticket_server or task_server)
 
     log.debug("Starting images service on port %d", config.images.port)
     image_server = ThreadedWSGIServer((config.images.host, config.images.port),
                                       WSGIRequestHandler)
     secure_server(config, image_server)
-    image_app = web.Application(config, [(r"/images/(.*)", Images)])
+
+    image_app = web.Application(config, [(r"/images/(.*)", Images),
+                                         (r"/tasks/(.*)", Tasks)])
     image_server.set_app(image_app)
     start_server(config, image_server, "image.server")
 
@@ -108,6 +114,7 @@ def stop():
     log.debug("Stopping services")
     image_server.shutdown()
     ticket_server.shutdown()
+    task_server.shutdown()
     image_server = None
     ticket_server = None
 
@@ -169,12 +176,52 @@ class Images(object):
         op.run()
         return response()
 
+    def post(self, ticket_id):
+        if not ticket_id:
+            raise HTTPBadRequest("Ticket id is required")
+
+        body = self.request.body
+        methodargs = json.loads(body)
+        if not 'backup_path' in methodargs:
+            raise HTTPBadRequest("Malformed request. Requires backup_path in the body")
+
+        destdir = os.path.split(methodargs['backup_path'])[0]
+        if not os.path.exists(destdir):
+            raise HTTPBadRequest("Backup_path does not exists")
+
+        # TODO: cancel copy if ticket expired or revoked
+        if methodargs['method'] == 'backup':
+            ticket = tickets.authorize(ticket_id, "read", 0)
+            self.log.debug("disk %s to %s for ticket %s",
+                            body, ticket.url.path, ticket_id)
+
+            ctask = celery_tasks.backup.delay(ticket_id,
+                                              ticket.url.path,
+                                              methodargs['backup_path'],
+                                              tickets.get(ticket_id).size,
+                                              self.config.daemon.buffer_size)
+        elif methodargs['method'] == 'restore':
+            ticket = tickets.authorize(ticket_id, "write", 0)
+            self.log.debug("disk %s to %s for ticket %s",
+                            body, ticket.url.path, ticket_id)
+
+            ctask = celery_tasks.restore.delay(ticket_id,
+                                               ticket.url.path,
+                                               methodargs['backup_path'],
+                                               tickets.get(ticket_id).size,
+                                               self.config.daemon.buffer_size)
+        else:
+            raise HTTPBadRequest("Invalid method")
+
+        r = response(status=206)
+        r.headers["Location"] = "/tasks/%s" % ctask.id
+        return r
+
     def get(self, ticket_id):
         # TODO: cancel copy if ticket expired or revoked
         if not ticket_id:
             raise HTTPBadRequest("Ticket id is required")
         # TODO: support partial range (e.g. bytes=0-*)
-
         if self.request.range:
             offset = self.request.range.start
             if self.request.range.end is None:
@@ -195,11 +242,23 @@ class Images(object):
                            size,
                            offset=offset,
                            buffersize=self.config.daemon.buffer_size)
+
+        filename = os.path.split(ticket.url.path)[1]
+        with open(os.path.join("/tmp", filename), "a+") as f:
+            f.seek(offset)
+            for data in op:
+                f.write(data)
+        op = directio.Send(ticket.url.path,
+                           None,
+                           size,
+                           offset=offset,
+                           buffersize=self.config.daemon.buffer_size)
         ticket.add_operation(op)
         content_disposition = "attachment"
         if ticket.filename:
             filename = ticket.filename.encode("utf-8")
             content_disposition += "; filename=%s" % filename
+
         resp = webob.Response(
             status=status,
             app_iter=op,
@@ -287,6 +346,41 @@ class Tickets(object):
         else:
             tickets.clear()
         return response(status=204)
+
+
+class Tasks(object):
+    """
+    Request handler for the /tasks/ resource.
+    """
+    log = logging.getLogger("tasks")
+
+    def __init__(self, config, request):
+        self.config = config
+        self.request = request
+
+    def get(self, task_id):
+        if not task_id:
+            raise HTTPBadRequest("Task id is required")
+
+        status = 200
+
+        self.log.info("Retrieving task %s", task_id)
+        try:
+            ctasks = celery.result.AsyncResult(task_id, app=celery_tasks.app)
+        except KeyError:
+            raise HTTPNotFound("No such task %r" % task_id)
+
+        result = ctasks.result
+
+        if not result:
+            result = {}
+
+        if isinstance(result, Exception):
+            result = {'Exception': result.message}
+
+        result['status'] = ctasks.status
+
+        return response(payload=result)
 
 
 class ThreadedWSGIServer(socketserver.ThreadingMixIn,

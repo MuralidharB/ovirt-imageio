@@ -1,5 +1,6 @@
 
 
+import copy
 import httplib
 import logging
 import uuid
@@ -82,6 +83,27 @@ class RequestHandler(object):
     @addcors
     def patch(self, res_id):
         return self.send_data(self.request)
+
+    @requiresession
+    @addcors
+    def post(self, res_id):
+        resource_id = self.get_resource_id(self.request)
+        imaged_url = self.get_imaged_url(self.request)
+
+        headers = self.get_default_headers(resource_id)
+
+        body = self.request.body
+        stream = False
+        logging.debug("Resource %s: transferring to backup media",
+                      resource_id)
+        imaged_response = self.make_imaged_request(
+            self.request.method, imaged_url, headers, body, stream)
+
+        response = server.response(imaged_response.status_code)
+        response.headers = copy.deepcopy(imaged_response.headers)
+        response.headers['Cache-Control'] = 'no-cache, no-store'
+
+        return response
 
     def send_data(self, request):
         """ Handles sending data to host for PUT or PATCH.
